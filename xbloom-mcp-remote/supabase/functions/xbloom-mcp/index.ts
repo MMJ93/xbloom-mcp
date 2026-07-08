@@ -1021,14 +1021,74 @@ function getSessionKey(req: Request): string {
 // client POSTs JSON-RPC messages to that URL,
 // server sends responses as SSE "message" events on the stream.
 
-// Per-session message queues for SSE transport.
-// WARNING: this Map lives in a single isolate's memory. A live ReadableStream
-// controller cannot be persisted, so on Supabase Edge (stateless, multi-isolate)
-// the SSE stream and its POST /message requests must be served by the SAME isolate
-// to work. When a POST /message lands on a different isolate, the lookup below
-// misses and we log "sse.session.miss" (an isolate-routing mismatch, not a login
-// problem). Prefer the Streamable HTTP transport (POST to root) for reliability.
-const sseSessions = new Map<string, { controller: ReadableStreamDefaultController; accessToken: string }>();
+// SSE session auth + outbound message queue live in Postgres, NOT in isolate memory:
+// on Supabase Edge the GET /sse stream and its POST /message requests can land on
+// different isolates. POST writes the response to sse_outbox; the GET /sse isolate
+// polls the outbox and flushes it onto the stream (see the SSE handlers below).
+const SSE_SESSION_TTL_SECONDS = 60 * 30; // 30 min
+const SSE_STREAM_MAX_MS = 110_000;       // bounded stream lifetime; SSE clients reconnect
+const SSE_POLL_MS = 400;
+
+async function storeSseSession(sessionId: string, accessToken: string): Promise<boolean> {
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/sse_sessions?on_conflict=session_id`, {
+      method: "POST",
+      headers: { ...REST_HEADERS, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        access_token: accessToken,
+        expires_at: new Date(Date.now() + SSE_SESSION_TTL_SECONDS * 1000).toISOString(),
+      }),
+    });
+    return resp.ok;
+  } catch { return false; }
+}
+
+// { token } if the SSE session exists (token may be ""); null if unknown/expired.
+async function getSseSession(sessionId: string): Promise<{ token: string } | null> {
+  if (!sessionId) return null;
+  try {
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/sse_sessions?session_id=eq.${encodeURIComponent(sessionId)}&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&select=access_token`,
+      { headers: REST_HEADERS },
+    );
+    if (!resp.ok) return null;
+    const rows = await resp.json().catch(() => null);
+    return Array.isArray(rows) && rows.length ? { token: rows[0].access_token ?? "" } : null;
+  } catch { return null; }
+}
+
+async function pushSseMessage(sessionId: string, payload: unknown): Promise<void> {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/sse_outbox`, {
+      method: "POST",
+      headers: { ...REST_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ session_id: sessionId, payload }),
+    });
+  } catch { /* the client reconnects and retries */ }
+}
+
+async function drainSseOutbox(sessionId: string, afterId: number): Promise<{ id: number; payload: unknown }[]> {
+  try {
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/sse_outbox?session_id=eq.${encodeURIComponent(sessionId)}&id=gt.${afterId}&order=id.asc&select=id,payload`,
+      { headers: REST_HEADERS },
+    );
+    if (!resp.ok) return [];
+    const rows = await resp.json().catch(() => null);
+    return Array.isArray(rows) ? rows : [];
+  } catch { return []; }
+}
+
+async function deleteSseOutbox(ids: number[]): Promise<void> {
+  if (!ids.length) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/sse_outbox?id=in.(${ids.join(",")})`, {
+      method: "DELETE",
+      headers: { ...REST_HEADERS, "Prefer": "return=minimal" },
+    });
+  } catch { /* best-effort; gt.lastId guards against re-send */ }
+}
 
 async function handleMcpMessage(body: Record<string, unknown>, accessToken: string): Promise<Record<string, unknown> | null> {
   const method = body.method as string;
@@ -1109,20 +1169,42 @@ Deno.serve(async (req: Request) => {
   if (req.method === "GET" && path.endsWith("/sse")) {
     const accessToken = getSessionKey(req) || "";
     const sessionId = generateToken();
+    await storeSseSession(sessionId, accessToken);
+    log("sse.open", { session: keyFingerprint(sessionId), key: keyFingerprint(accessToken) });
 
+    const encoder = new TextEncoder();
+    let cancelled = false;
     const stream = new ReadableStream({
-      start(controller) {
-        // Store session (in this isolate's memory only — see WARNING above)
-        sseSessions.set(sessionId, { controller, accessToken });
-        log("sse.open", { session: keyFingerprint(sessionId), key: keyFingerprint(accessToken) });
-
-        // Send endpoint event — tells client where to POST messages
-        const endpointUrl = `${BASE_URL}/message?sessionId=${sessionId}`;
-        controller.enqueue(new TextEncoder().encode(`event: endpoint\ndata: ${endpointUrl}\n\n`));
+      async start(controller) {
+        // Tell the client where to POST messages.
+        controller.enqueue(encoder.encode(`event: endpoint\ndata: ${BASE_URL}/message?sessionId=${sessionId}\n\n`));
+        // Relay loop: flush responses written to sse_outbox by POST /message (which may
+        // run on a different isolate) onto this stream. This is what makes SSE survive
+        // multi-isolate routing.
+        let lastId = 0;
+        let sincePing = 0;
+        const deadline = Date.now() + SSE_STREAM_MAX_MS;
+        try {
+          while (!cancelled && Date.now() < deadline) {
+            const rows = await drainSseOutbox(sessionId, lastId);
+            if (rows.length) {
+              for (const r of rows) {
+                controller.enqueue(encoder.encode(`event: message\ndata: ${JSON.stringify(r.payload)}\n\n`));
+                const rid = Number(r.id);
+                if (rid > lastId) lastId = rid;
+              }
+              await deleteSseOutbox(rows.map((r) => Number(r.id)));
+              sincePing = 0;
+            } else if (++sincePing >= 25) {
+              controller.enqueue(encoder.encode(`: ping\n\n`)); // keepalive (~10s idle)
+              sincePing = 0;
+            }
+            await new Promise((res) => setTimeout(res, SSE_POLL_MS));
+          }
+        } catch { /* client disconnected */ }
+        try { controller.close(); } catch { /* already closed */ }
       },
-      cancel() {
-        sseSessions.delete(sessionId);
-      },
+      cancel() { cancelled = true; },
     });
 
     return new Response(stream, {
@@ -1135,14 +1217,15 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  // POST /message?sessionId=xxx — receive JSON-RPC, send response via SSE stream
+  // POST /message?sessionId=xxx — receive JSON-RPC; the response is queued in
+  // sse_outbox and delivered by the GET /sse relay loop (on whichever isolate holds
+  // the stream). Works regardless of which isolate handles this POST.
   if (req.method === "POST" && path.endsWith("/message")) {
     const sessionId = url.searchParams.get("sessionId") || "";
-    const session = sseSessions.get(sessionId);
+    const session = await getSseSession(sessionId);
 
     if (!session) {
-      // Isolate-routing mismatch: the SSE stream was opened on a different isolate.
-      log("sse.session.miss", { sessions: sseSessions.size });
+      log("sse.session.miss", {});
       return new Response(JSON.stringify({ error: "Invalid session" }), {
         status: 400, headers: { "Content-Type": "application/json", ...CORS_HEADERS },
       });
@@ -1155,20 +1238,11 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const response = await handleMcpMessage(body, session.accessToken);
+    // Prefer the token on this request (the client sends it on every call); fall back
+    // to the one captured when the stream opened.
+    const response = await handleMcpMessage(body, getSessionKey(req) || session.token);
+    if (response) await pushSseMessage(sessionId, response);
 
-    if (response) {
-      // Send response as SSE event on the stream
-      const data = JSON.stringify(response);
-      try {
-        session.controller.enqueue(new TextEncoder().encode(`event: message\ndata: ${data}\n\n`));
-      } catch {
-        // Stream closed
-        sseSessions.delete(sessionId);
-      }
-    }
-
-    // Acknowledge the POST
     return new Response(null, { status: 202, headers: CORS_HEADERS });
   }
 
