@@ -103,28 +103,35 @@ Everything below is for developers who want to self-host or modify the server.
 - [Supabase CLI](https://supabase.com/docs/guides/cli/getting-started)
 - [Deno 2.x](https://deno.com)
 
-#### 1. Clone and deploy
+#### 1. Clone
 
 ```bash
 git clone https://github.com/denull0/xbloom-agent.git
 cd xbloom-agent/xbloom-mcp-remote
-supabase functions deploy xbloom-mcp --no-verify-jwt
 ```
 
-#### 2. Create the sessions table
+#### 2. Apply the database migration FIRST
 
-```sql
-CREATE TABLE user_sessions (
-  access_token TEXT PRIMARY KEY,
-  encrypted_creds TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-ALTER TABLE user_sessions ENABLE ROW LEVEL SECURITY;
+The function writes `refresh_token` / `expires_at` columns, so the schema must exist
+before you deploy — otherwise every write fails and login can't persist a session.
+
+```bash
+supabase db push   # applies supabase/migrations/ (creates/updates user_sessions)
+```
+
+The migration is idempotent and also relaxes/upgrades a table created by an older
+version. If you can't run `supabase db push`, run the SQL in
+`supabase/migrations/20260707000000_user_sessions.sql` against your database.
+
+#### 3. Deploy the function
+
+```bash
+supabase functions deploy xbloom-mcp --no-verify-jwt
 ```
 
 No environment variables needed — the server uses `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` which are automatically available in edge functions.
 
-#### 3. Connect Claude
+#### 4. Connect Claude
 
 Add your server URL in Claude integrations:
 

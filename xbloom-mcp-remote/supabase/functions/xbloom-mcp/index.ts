@@ -68,36 +68,140 @@ function decryptCredentials(blob: string): UserCredentials | null {
   }
 }
 
-// --- DB storage (encrypted, RLS-protected) ---
+// --- Diagnostics ---
+// A fresh id per isolate. Supabase Edge Functions are stateless and may route
+// consecutive requests to different isolates, so two back-to-back tool calls can
+// legitimately log different INSTANCE_IDs. Because of this, nothing may be trusted
+// to survive in module-level memory between invocations — all session state that
+// must outlive a single request lives in the user_sessions table below.
+const INSTANCE_ID = crypto.randomUUID();
 
-async function storeSession(accessToken: string, creds: UserCredentials): Promise<boolean> {
-  const encrypted = encryptCredentials(creds);
-  const resp = await fetch(`${SUPABASE_URL}/rest/v1/user_sessions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "apikey": SUPABASE_SERVICE_KEY,
-      "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
-      "Prefer": "resolution=merge-duplicates",
-    },
-    body: JSON.stringify({ access_token: accessToken, encrypted_creds: encrypted }),
-  });
-  return resp.ok;
+// Short, non-reversible tag so logs can correlate session keys without leaking tokens.
+function keyFingerprint(key: string): string {
+  if (!key) return "<empty>";
+  return createHmac("sha256", "xbloom-log-fp").update(key).digest("hex").slice(0, 8);
 }
 
+function log(event: string, fields: Record<string, unknown> = {}): void {
+  console.log(JSON.stringify({ instance: INSTANCE_ID, event, ...fields }));
+}
+
+// --- DB storage (encrypted, RLS-protected, keyed by MCP session / OAuth token) ---
+
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 365; // 1 year, matches OAuth expires_in
+
+function expiryTimestamp(): string {
+  return new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
+}
+
+interface SessionRow {
+  access_token: string;
+  refresh_token?: string | null;
+  encrypted_creds?: string | null;
+}
+
+const REST_HEADERS: Record<string, string> = {
+  "apikey": SUPABASE_SERVICE_KEY,
+  "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+};
+
+// Log a PostgREST failure WITHOUT the response body: on constraint violations the
+// body's `details` field echoes the conflicting column VALUES verbatim (e.g. the
+// full access_token), which would leak live bearer tokens into logs. Keep only the
+// structured code/message, which never contain row values.
+async function logDbFail(event: string, resp: Response): Promise<void> {
+  let code: unknown, message: unknown;
+  try {
+    const body = JSON.parse(await resp.text());
+    code = body?.code;
+    message = body?.message;
+  } catch { /* non-JSON error body */ }
+  log(event, { status: resp.status, code, message });
+}
+
+// Idempotent upsert keyed on access_token. `on_conflict=access_token` is REQUIRED:
+// PostgREST's merge-duplicates infers the conflict target from the primary key only
+// unless this param is given, so without it a table whose access_token is UNIQUE (not
+// PK) would 409 instead of upserting. Returns false (never throws) on any failure.
+async function upsertSessionRow(row: SessionRow): Promise<boolean> {
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/user_sessions?on_conflict=access_token`, {
+      method: "POST",
+      headers: {
+        ...REST_HEADERS,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({ ...row, expires_at: expiryTimestamp(), updated_at: new Date().toISOString() }),
+    });
+    if (!resp.ok) {
+      await logDbFail("db.upsert.fail", resp);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    // Network-level failure (DNS, reset) — must not escape as an unhandled rejection.
+    log("db.upsert.fail", { error: String(e) });
+    return false;
+  }
+}
+
+// Called at login: attach the encrypted XBloom creds to the row for this session key.
+async function storeSession(accessToken: string, creds: UserCredentials): Promise<boolean> {
+  const encrypted = encryptCredentials(creds);
+  const ok = await upsertSessionRow({ access_token: accessToken, encrypted_creds: encrypted });
+  log("session.store", { key: keyFingerprint(accessToken), ok });
+  return ok;
+}
+
+// Called at the start of every authed tool handler. Throws on a DB transport error
+// so a transient PostgREST outage surfaces as a retryable error, NOT as a bogus
+// "you need to log in first" (which would prompt the user to re-enter credentials).
 async function getSession(accessToken: string): Promise<UserCredentials | null> {
   const resp = await fetch(
-    `${SUPABASE_URL}/rest/v1/user_sessions?access_token=eq.${encodeURIComponent(accessToken)}&select=encrypted_creds`,
-    {
-      headers: {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
-      },
-    },
+    `${SUPABASE_URL}/rest/v1/user_sessions?access_token=eq.${encodeURIComponent(accessToken)}&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&select=encrypted_creds`,
+    { headers: REST_HEADERS },
   );
-  const rows = await resp.json();
-  if (!Array.isArray(rows) || rows.length === 0) return null;
-  return decryptCredentials(rows[0].encrypted_creds);
+  if (!resp.ok) throw new Error(`user_sessions lookup failed: ${resp.status}`);
+  const rows = await resp.json().catch(() => null);
+  const row = Array.isArray(rows) ? rows[0] : null;
+  let creds: UserCredentials | null = null;
+  if (row?.encrypted_creds) {
+    creds = decryptCredentials(row.encrypted_creds);
+    // Row exists but the blob won't decrypt — distinct from a missing row. The usual
+    // cause is a rotated SUPABASE_SERVICE_ROLE_KEY (the AES key source), so surface it
+    // separately instead of letting it look like a session-key mismatch.
+    if (!creds) log("session.decrypt_failed", { key: keyFingerprint(accessToken) });
+  }
+  log("session.lookup", { key: keyFingerprint(accessToken), found: !!creds, hasRow: !!row });
+  return creds;
+}
+
+// Look up a session by its refresh token — used only during OAuth token rotation, so
+// creds stored under the old access token survive the switch to a new one. Throws on a
+// DB transport error so the caller returns a retryable 5xx rather than silently
+// dropping the session; returns null only for a genuine miss.
+async function getRowByRefreshToken(refreshToken: string): Promise<{ encrypted_creds: string | null } | null> {
+  if (!refreshToken) return null;
+  const resp = await fetch(
+    `${SUPABASE_URL}/rest/v1/user_sessions?refresh_token=eq.${encodeURIComponent(refreshToken)}&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&select=encrypted_creds`,
+    { headers: REST_HEADERS },
+  );
+  if (!resp.ok) throw new Error(`user_sessions refresh lookup failed: ${resp.status}`);
+  const rows = await resp.json().catch(() => null);
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+// Invalidate a rotated refresh token's row so old access/refresh tokens can't be
+// replayed. Best-effort: rotation still succeeds if cleanup fails.
+async function deleteSessionByRefreshToken(refreshToken: string): Promise<void> {
+  if (!refreshToken) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/user_sessions?refresh_token=eq.${encodeURIComponent(refreshToken)}`, {
+      method: "DELETE",
+      headers: { ...REST_HEADERS, "Prefer": "return=minimal" },
+    });
+  } catch { /* best-effort */ }
 }
 
 // --- RSA Encryption (hutool-style chunking) ---
@@ -150,6 +254,24 @@ async function postEncrypted(
   } catch (e) {
     return { result: "error", error: String(e) };
   }
+}
+
+// Turn an XBloom non-success response into a user-facing message. XBloom returns its
+// own reason under one of several possible keys — surface that instead of always
+// blaming session expiry (a validation reject and an expired token are NOT the same),
+// and only suggest re-login when the failure actually looks auth-related. The XBloom
+// token is durable in practice, so genuine "log in again" cases are rare; the common
+// case is a validation error whose real message the user needs to see.
+function xbloomFailure(resp: Record<string, unknown>, action: string): string {
+  const detail = [
+    resp.msg, resp.message, resp.errorMsg, resp.errorMessage,
+    resp.error, resp.reason, resp.tips, resp.info,
+  ].find((v) => typeof v === "string" && (v as string).trim()) as string | undefined;
+  const looksAuth = !detail || /token|login|auth|expire|unauthor|登录|登陆|会话|未登录/i.test(detail);
+  const reauth = looksAuth ? " If this looks like a session issue, run xbloom_login again." : "";
+  return detail
+    ? `Failed to ${action}: ${detail}.${reauth}`
+    : `Failed to ${action}. Your XBloom session may have expired — run xbloom_login again.`;
 }
 
 // --- Auth ---
@@ -342,17 +464,25 @@ async function loginXbloom(args: Record<string, unknown>, accessToken: string): 
   });
 
   if (resp.result === "success") {
-    const member = resp.member as Record<string, unknown>;
+    const member = resp.member as Record<string, unknown> | undefined;
+    const token = resp.token as string | undefined;
+    // Confirm XBloom actually returned the fields we depend on for later requests.
+    if (!member || !member.tableId || !token) {
+      log("login.capture.fail", { key: keyFingerprint(accessToken), hasMember: !!member, hasToken: !!token });
+      return `Login response was missing expected fields (member id / token). Please try again.`;
+    }
     const creds: UserCredentials = {
       memberId: member.tableId as number,
-      token: resp.token as string,
+      token,
       email: args.email as string,
     };
     const saved = await storeSession(accessToken, creds);
+    log("login.success", { key: keyFingerprint(accessToken), memberId: creds.memberId, tokenCaptured: true, saved });
     if (!saved) return `Login succeeded but session could not be saved. Please try again.`;
     return `Logged in successfully. Your recipes are now accessible.`;
   }
 
+  log("login.fail", { key: keyFingerprint(accessToken), result: resp.result });
   return `Login failed. Please check your email and password.`;
 }
 
@@ -369,7 +499,7 @@ async function listRecipes(creds: UserCredentials): Promise<string> {
     }
     return lines.join("\n");
   }
-  return `Failed to list recipes. Your session may have expired — try logging in again.`;
+  return xbloomFailure(resp, "list recipes");
 }
 
 async function createRecipe(args: Record<string, unknown>, creds: UserCredentials): Promise<string> {
@@ -400,7 +530,7 @@ async function createRecipe(args: Record<string, unknown>, creds: UserCredential
     const shareId = btoa(String(resp.tableId));
     return `Recipe '${args.name}' created!\nShare: ${SHARE_BASE}/?id=${encodeURIComponent(shareId)}`;
   }
-  return `Failed. Your session may have expired — try logging in again.`;
+  return xbloomFailure(resp, "create the recipe");
 }
 
 async function createTeaRecipe(args: Record<string, unknown>, creds: UserCredentials): Promise<string> {
@@ -441,7 +571,7 @@ async function createTeaRecipe(args: Record<string, unknown>, creds: UserCredent
     const shareId = btoa(String(resp.tableId));
     return `Tea recipe '${args.name}' created!\nShare: ${SHARE_BASE}/?id=${encodeURIComponent(shareId)}`;
   }
-  return `Failed. Your session may have expired — try logging in again.`;
+  return xbloomFailure(resp, "create the tea recipe");
 }
 
 async function editRecipe(args: Record<string, unknown>, creds: UserCredentials): Promise<string> {
@@ -495,13 +625,13 @@ async function editRecipe(args: Record<string, unknown>, creds: UserCredentials)
 
   const resp = await postEncrypted("tuRecipeUpdate.tuhtml", payload);
   if (resp.result === "success") return `Recipe [${recipeId}] updated!`;
-  return `Failed. Your session may have expired — try logging in again.`;
+  return xbloomFailure(resp, `update recipe [${recipeId}]`);
 }
 
 async function deleteRecipe(args: Record<string, unknown>, creds: UserCredentials): Promise<string> {
   const resp = await postEncrypted("tuRecipeDelete.tuhtml", { ...authBase(creds), tableId: args.recipe_id });
   if (resp.result === "success") return `Recipe [${args.recipe_id}] deleted.`;
-  return `Failed. Your session may have expired — try logging in again.`;
+  return xbloomFailure(resp, `delete recipe [${args.recipe_id}]`);
 }
 
 async function fetchRecipe(args: Record<string, unknown>): Promise<string> {
@@ -543,6 +673,11 @@ async function handleToolCall(params: Record<string, unknown>, accessToken: stri
   const name = params.name as string;
   const args = (params.arguments as Record<string, unknown>) || {};
 
+  // Per-call diagnostics: correlate the isolate + session key across login and the
+  // failing call. If login and a later call log different `key` fingerprints, the
+  // session key is not stable between requests (the root cause of "log in first").
+  log("tool.call", { tool: name, key: keyFingerprint(accessToken) });
+
   try {
     // Fetch recipe doesn't require auth
     if (name === "xbloom_fetch_recipe") {
@@ -551,6 +686,7 @@ async function handleToolCall(params: Record<string, unknown>, accessToken: stri
 
     // All other tools require a valid bearer token
     if (!accessToken) {
+      log("tool.no_key", { tool: name });
       return {
         content: [{ type: "text", text: "Authentication required. Please reconnect the integration." }],
         isError: true,
@@ -563,6 +699,10 @@ async function handleToolCall(params: Record<string, unknown>, accessToken: stri
 
     const creds = await getSession(accessToken);
     if (!creds) {
+      // Note: this is the MCP's own session store missing the key — it is NOT
+      // XBloom returning 401. An expired XBloom token surfaces as a per-tool
+      // "session may have expired" message from the tool functions below.
+      log("tool.no_session", { tool: name, key: keyFingerprint(accessToken) });
       return {
         content: [{ type: "text", text: "You need to log in first. Use xbloom_login with your XBloom email and password." }],
         isError: true,
@@ -606,6 +746,15 @@ function generateToken(): string {
   return Array.from(arr, b => b.toString(16).padStart(2, "0")).join("");
 }
 
+// OAuth token-endpoint response. Cache-Control: no-store is required by RFC 6749
+// §5.1 for any response carrying tokens, so intermediaries don't cache the secrets.
+function tokenResponse(body: Record<string, unknown>, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
 async function handleAuthorize(url: URL): Promise<Response> {
   const redirectUri = url.searchParams.get("redirect_uri");
   const state = url.searchParams.get("state");
@@ -628,40 +777,75 @@ async function handleToken(req: Request): Promise<Response> {
   }
 
   const grantType = params.get("grant_type");
+  const dbUnavailable = () =>
+    tokenResponse({ error: "temporarily_unavailable", error_description: "Session store unavailable, please retry." }, 503);
 
   if (grantType === "authorization_code") {
     const accessToken = generateToken();
     const refreshToken = generateToken();
-    return new Response(JSON.stringify({
+    // Pre-create the session row linking access_token <-> refresh_token. The XBloom
+    // creds aren't attached until xbloom_login, but recording the pair now means a
+    // later refresh_token exchange can find this session by its refresh_token. If the
+    // write fails, do NOT issue tokens — a token with no backing row would silently
+    // lose the refresh linkage and log the user out at the next rotation.
+    if (!(await upsertSessionRow({ access_token: accessToken, refresh_token: refreshToken }))) {
+      return dbUnavailable();
+    }
+    log("oauth.issue", { grant: "authorization_code", access: keyFingerprint(accessToken), refresh: keyFingerprint(refreshToken) });
+    return tokenResponse({
       access_token: accessToken,
       token_type: "bearer",
-      expires_in: 31536000,
+      expires_in: SESSION_TTL_SECONDS,
       refresh_token: refreshToken,
-    }), { headers: { "Content-Type": "application/json" } });
+    });
   }
 
   if (grantType === "refresh_token") {
     const oldRefreshToken = params.get("refresh_token") || "";
-    const newAccessToken = generateToken();
-    const newRefreshToken = generateToken();
 
-    // Migrate session from old token to new token
-    const oldCreds = await getSession(oldRefreshToken);
-    if (oldCreds) {
-      await storeSession(newAccessToken, oldCreds);
+    // Look up the session by its REFRESH token. Distinguish a genuine miss (unknown/
+    // expired token → invalid_grant per RFC 6749 §5.2, so the client re-runs the auth
+    // flow) from a transient DB error (getRowByRefreshToken throws → 503, retryable).
+    // Silently rotating on a miss would strand the stored creds and log the user out.
+    let oldRow: { encrypted_creds: string | null } | null;
+    try {
+      oldRow = await getRowByRefreshToken(oldRefreshToken);
+    } catch {
+      return dbUnavailable();
+    }
+    if (!oldRow) {
+      log("oauth.refresh.miss", { oldRefresh: keyFingerprint(oldRefreshToken) });
+      return tokenResponse({ error: "invalid_grant", error_description: "Unknown or expired refresh token." }, 400);
     }
 
-    return new Response(JSON.stringify({
+    const newAccessToken = generateToken();
+    const newRefreshToken = generateToken();
+    // Carry the encrypted creds forward. Omit the field entirely when absent rather
+    // than writing an explicit null, to avoid ever clobbering creds on a merge.
+    if (!(await upsertSessionRow({
+      access_token: newAccessToken,
+      refresh_token: newRefreshToken,
+      ...(oldRow.encrypted_creds ? { encrypted_creds: oldRow.encrypted_creds } : {}),
+    }))) {
+      return dbUnavailable();
+    }
+    // Invalidate the old row so the rotated-away tokens can't be replayed.
+    await deleteSessionByRefreshToken(oldRefreshToken);
+    log("oauth.refresh", {
+      oldRefresh: keyFingerprint(oldRefreshToken),
+      newAccess: keyFingerprint(newAccessToken),
+      migratedCreds: !!oldRow.encrypted_creds,
+    });
+
+    return tokenResponse({
       access_token: newAccessToken,
       token_type: "bearer",
-      expires_in: 31536000,
+      expires_in: SESSION_TTL_SECONDS,
       refresh_token: newRefreshToken,
-    }), { headers: { "Content-Type": "application/json" } });
+    });
   }
 
-  return new Response(JSON.stringify({ error: "unsupported_grant_type" }), {
-    status: 400, headers: { "Content-Type": "application/json" },
-  });
+  return tokenResponse({ error: "unsupported_grant_type" }, 400);
 }
 
 // --- Main handler ---
@@ -693,7 +877,13 @@ function getSessionKey(req: Request): string {
 // client POSTs JSON-RPC messages to that URL,
 // server sends responses as SSE "message" events on the stream.
 
-// Per-session message queues for SSE transport
+// Per-session message queues for SSE transport.
+// WARNING: this Map lives in a single isolate's memory. A live ReadableStream
+// controller cannot be persisted, so on Supabase Edge (stateless, multi-isolate)
+// the SSE stream and its POST /message requests must be served by the SAME isolate
+// to work. When a POST /message lands on a different isolate, the lookup below
+// misses and we log "sse.session.miss" (an isolate-routing mismatch, not a login
+// problem). Prefer the Streamable HTTP transport (POST to root) for reliability.
 const sseSessions = new Map<string, { controller: ReadableStreamDefaultController; accessToken: string }>();
 
 async function handleMcpMessage(body: Record<string, unknown>, accessToken: string): Promise<Record<string, unknown> | null> {
@@ -774,8 +964,9 @@ Deno.serve(async (req: Request) => {
 
     const stream = new ReadableStream({
       start(controller) {
-        // Store session
+        // Store session (in this isolate's memory only — see WARNING above)
         sseSessions.set(sessionId, { controller, accessToken });
+        log("sse.open", { session: keyFingerprint(sessionId), key: keyFingerprint(accessToken) });
 
         // Send endpoint event — tells client where to POST messages
         const endpointUrl = `${BASE_URL}/message?sessionId=${sessionId}`;
@@ -802,6 +993,8 @@ Deno.serve(async (req: Request) => {
     const session = sseSessions.get(sessionId);
 
     if (!session) {
+      // Isolate-routing mismatch: the SSE stream was opened on a different isolate.
+      log("sse.session.miss", { sessions: sseSessions.size });
       return new Response(JSON.stringify({ error: "Invalid session" }), {
         status: 400, headers: { "Content-Type": "application/json", ...CORS_HEADERS },
       });
@@ -843,17 +1036,21 @@ Deno.serve(async (req: Request) => {
   let body: Record<string, unknown>;
   try { body = await req.json(); } catch { return jsonRpcErr(null, -32700, "Parse error"); }
 
-  // On initialize, generate a session ID if client doesn't have one
+  // On initialize, generate a session ID if the client doesn't have one (authless).
   const method = body.method as string;
+  let generatedSessionKey = false;
   if (method === "initialize" && !sessionKey) {
     sessionKey = generateToken();
+    generatedSessionKey = true;
   }
 
   const response = await handleMcpMessage(body, sessionKey);
   if (!response) return new Response(null, { status: 204, headers: CORS_HEADERS });
 
   const headers: Record<string, string> = { "Content-Type": "application/json", ...CORS_HEADERS };
-  if (method === "initialize" && sessionKey) {
+  // Only echo a session id we generated. Never reflect an OAuth bearer token into
+  // Mcp-Session-Id — that would copy the credential into a header proxies/logs keep.
+  if (method === "initialize" && generatedSessionKey) {
     headers["Mcp-Session-Id"] = sessionKey;
   }
   return new Response(JSON.stringify(response), { headers });
