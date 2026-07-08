@@ -1238,8 +1238,12 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // Prefer the token on this request (the client sends it on every call); fall back
-    // to the one captured when the stream opened.
+    // Process synchronously: the session write (e.g. login's storeSession) must be
+    // committed before we ack, so a client that sends its NEXT call after this 202
+    // (or after seeing login's result) reliably sees the committed session. Acking
+    // early and processing in the background reintroduces a login->create race that
+    // surfaces as "You need to log in first". The response is queued to sse_outbox and
+    // delivered on the stream by the GET /sse relay loop.
     const response = await handleMcpMessage(body, getSessionKey(req) || session.token);
     if (response) await pushSseMessage(sessionId, response);
 
