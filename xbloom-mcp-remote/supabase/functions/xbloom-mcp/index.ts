@@ -5,7 +5,7 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { Buffer } from "node:buffer";
-import { publicEncrypt, constants, createCipheriv, createDecipheriv, randomBytes, createHmac } from "node:crypto";
+import { publicEncrypt, constants, createCipheriv, createDecipheriv, randomBytes, createHmac, createHash } from "node:crypto";
 
 // --- XBloom API constants ---
 
@@ -755,13 +755,135 @@ function tokenResponse(body: Record<string, unknown>, status = 200): Response {
   });
 }
 
+// --- OAuth durable state (PKCE codes + registered clients) ---
+// Stored in the DB, NOT in memory: /register, /authorize and /token are separate
+// requests that may each hit a different Edge isolate, so any in-memory store would
+// fail intermittently (the same statelessness that broke session storage).
+
+const AUTH_CODE_TTL_SECONDS = 600; // 10 minutes
+
+function isLoopback(host: string): boolean {
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+}
+
+// Persist a dynamically-registered client's redirect URIs so /authorize can validate
+// against them (exact match, per the MCP spec's open-redirect requirement).
+async function storeClient(clientId: string, redirectUris: string[]): Promise<void> {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/oauth_clients?on_conflict=client_id`, {
+      method: "POST",
+      headers: { ...REST_HEADERS, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({ client_id: clientId, redirect_uris: redirectUris }),
+    });
+  } catch { /* best-effort; /authorize falls back to the https/loopback baseline */ }
+}
+
+async function getClientRedirectUris(clientId: string): Promise<string[] | null> {
+  if (!clientId) return null;
+  try {
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/oauth_clients?client_id=eq.${encodeURIComponent(clientId)}&select=redirect_uris`,
+      { headers: REST_HEADERS },
+    );
+    if (!resp.ok) return null;
+    const rows = await resp.json().catch(() => null);
+    const uris = Array.isArray(rows) && rows.length ? rows[0].redirect_uris : null;
+    return Array.isArray(uris) ? uris : null;
+  } catch { return null; }
+}
+
+// redirect_uri policy: exact-match a registered URI when the client is known; otherwise
+// fall back to the spec baseline (HTTPS, or http on loopback) so a client that
+// registered before this feature shipped isn't locked out, while arbitrary http
+// phishing targets are still rejected.
+function redirectAllowed(redirectUri: string, registered: string[] | null): boolean {
+  if (registered && registered.length) return registered.includes(redirectUri);
+  let u: URL;
+  try { u = new URL(redirectUri); } catch { return false; }
+  if (u.protocol === "https:") return true;
+  if (u.protocol === "http:" && isLoopback(u.hostname)) return true;
+  return false;
+}
+
+async function storeAuthCode(row: {
+  code: string; code_challenge: string | null; code_challenge_method: string | null;
+  redirect_uri: string; client_id: string | null;
+}): Promise<boolean> {
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/oauth_codes`, {
+      method: "POST",
+      headers: { ...REST_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ ...row, expires_at: new Date(Date.now() + AUTH_CODE_TTL_SECONDS * 1000).toISOString() }),
+    });
+    if (!resp.ok) await logDbFail("oauth.code.store.fail", resp);
+    return resp.ok;
+  } catch (e) {
+    log("oauth.code.store.fail", { error: String(e) });
+    return false;
+  }
+}
+
+// Atomically fetch-and-delete a non-expired code (one-time use). Throws on a DB
+// transport error; returns null for a genuinely absent/expired code.
+async function consumeAuthCode(code: string): Promise<
+  { code_challenge: string | null; code_challenge_method: string | null; redirect_uri: string } | null
+> {
+  if (!code) return null;
+  const resp = await fetch(
+    `${SUPABASE_URL}/rest/v1/oauth_codes?code=eq.${encodeURIComponent(code)}&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&select=code_challenge,code_challenge_method,redirect_uri`,
+    { method: "DELETE", headers: { ...REST_HEADERS, "Prefer": "return=representation", "Accept": "application/json" } },
+  );
+  if (!resp.ok) throw new Error(`oauth_codes consume failed: ${resp.status}`);
+  const rows = await resp.json().catch(() => null);
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+// PKCE verification (RFC 7636). Consume-then-verify order means a failed check still
+// burns the code, so a code can't be brute-forced against.
+function verifyPkce(challenge: string | null, method: string | null, verifier: string): boolean {
+  if (!challenge) return true; // no challenge was registered → nothing to verify
+  if (!verifier) return false;
+  if (method === "S256") {
+    return Buffer.from(createHash("sha256").update(verifier).digest()).toString("base64url") === challenge;
+  }
+  return verifier === challenge; // "plain"
+}
+
 async function handleAuthorize(url: URL): Promise<Response> {
   const redirectUri = url.searchParams.get("redirect_uri");
   const state = url.searchParams.get("state");
+  const clientId = url.searchParams.get("client_id") || "";
+  const codeChallenge = url.searchParams.get("code_challenge");
+  const codeChallengeMethod = url.searchParams.get("code_challenge_method") || "plain";
+
   if (!redirectUri) return new Response("Missing redirect_uri", { status: 400 });
 
+  // Open-redirect protection: only bounce the browser to a redirect_uri the client
+  // registered (exact match), or an HTTPS/loopback URI for pre-registration clients.
+  const registered = await getClientRedirectUris(clientId);
+  if (!redirectAllowed(redirectUri, registered)) {
+    log("oauth.authorize.bad_redirect", { client: keyFingerprint(clientId) });
+    return new Response("Invalid redirect_uri", { status: 400 });
+  }
+
+  // Require PKCE (MCP clients MUST use it) — never issue a code redeemable without proof.
+  if (!codeChallenge) {
+    log("oauth.authorize.no_pkce", { client: keyFingerprint(clientId) });
+    return new Response("code_challenge required (PKCE)", { status: 400 });
+  }
+
+  let redirect: URL;
+  try { redirect = new URL(redirectUri); } catch { return new Response("Invalid redirect_uri", { status: 400 }); }
+
   const code = generateToken();
-  const redirect = new URL(redirectUri);
+  if (!(await storeAuthCode({
+    code, code_challenge: codeChallenge, code_challenge_method: codeChallengeMethod,
+    redirect_uri: redirectUri, client_id: clientId || null,
+  }))) {
+    return new Response("Authorization temporarily unavailable, please retry", { status: 503 });
+  }
+
+  log("oauth.authorize", { client: keyFingerprint(clientId), method: codeChallengeMethod });
   redirect.searchParams.set("code", code);
   if (state) redirect.searchParams.set("state", state);
   return Response.redirect(redirect.toString(), 302);
@@ -781,6 +903,28 @@ async function handleToken(req: Request): Promise<Response> {
     tokenResponse({ error: "temporarily_unavailable", error_description: "Session store unavailable, please retry." }, 503);
 
   if (grantType === "authorization_code") {
+    // Validate the authorization code (one-time use) and PKCE before issuing anything.
+    const code = params.get("code") || "";
+    const codeVerifier = params.get("code_verifier") || "";
+    const redirectUri = params.get("redirect_uri") || "";
+    let codeRow;
+    try {
+      codeRow = await consumeAuthCode(code);
+    } catch {
+      return dbUnavailable();
+    }
+    if (!codeRow) {
+      log("oauth.code.invalid", {});
+      return tokenResponse({ error: "invalid_grant", error_description: "Invalid or expired authorization code." }, 400);
+    }
+    if (codeRow.redirect_uri && redirectUri && codeRow.redirect_uri !== redirectUri) {
+      return tokenResponse({ error: "invalid_grant", error_description: "redirect_uri mismatch." }, 400);
+    }
+    if (!verifyPkce(codeRow.code_challenge, codeRow.code_challenge_method, codeVerifier)) {
+      log("oauth.pkce.fail", {});
+      return tokenResponse({ error: "invalid_grant", error_description: "PKCE verification failed." }, 400);
+    }
+
     const accessToken = generateToken();
     const refreshToken = generateToken();
     // Pre-create the session row linking access_token <-> refresh_token. The XBloom
@@ -945,11 +1089,15 @@ Deno.serve(async (req: Request) => {
   if (req.method === "POST" && path.endsWith("/register")) {
     let body: Record<string, unknown> = {};
     try { body = await req.json(); } catch { /* ok */ }
+    const clientId = generateToken();
+    const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris as string[] : [];
+    // Persist client_id -> redirect_uris so /authorize can validate exact matches.
+    await storeClient(clientId, redirectUris);
     return jsonResponse({
-      client_id: generateToken(),
+      client_id: clientId,
       client_secret: generateToken(),
       client_name: body.client_name || "Claude",
-      redirect_uris: body.redirect_uris || [],
+      redirect_uris: redirectUris,
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "client_secret_post",
