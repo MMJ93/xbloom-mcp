@@ -697,11 +697,18 @@ async function handleToolCall(params: Record<string, unknown>, accessToken: stri
       return { content: [{ type: "text", text: await loginXbloom(args, accessToken) }] };
     }
 
-    const creds = await getSession(accessToken);
+    // Look up the stored session. If it's missing, briefly retry before giving up: an
+    // SSE client can pipeline login+create, so a create may arrive while login's
+    // session write is still committing on a concurrent request. Retrying absorbs that
+    // race instead of returning "log in first" — which makes agents re-login and loop.
+    // (This is NOT XBloom returning 401; a truly expired XBloom token surfaces as a
+    // per-tool "session may have expired" message from the tool functions below.)
+    let creds = await getSession(accessToken);
+    for (let i = 0; i < 6 && !creds; i++) {
+      await new Promise((r) => setTimeout(r, 400));
+      creds = await getSession(accessToken);
+    }
     if (!creds) {
-      // Note: this is the MCP's own session store missing the key — it is NOT
-      // XBloom returning 401. An expired XBloom token surfaces as a per-tool
-      // "session may have expired" message from the tool functions below.
       log("tool.no_session", { tool: name, key: keyFingerprint(accessToken) });
       return {
         content: [{ type: "text", text: "You need to log in first. Use xbloom_login with your XBloom email and password." }],
