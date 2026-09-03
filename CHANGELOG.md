@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.1 - 2026-09-03
+
+- Add `dripper_type` to coffee create and edit tools.
+- Map `other` to xBloom `cupType: 3` so recipes above 18g remain editable.
+- Report the actual dripper type in recipe lists and fetched recipe details.
+
 ## 2.1.0 - 2026-09-03
 
 - Add `xbloom_list_shared_recipes` using xBloom's account-shared endpoint.

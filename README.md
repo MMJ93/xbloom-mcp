@@ -3,8 +3,8 @@
 Personal xBloom MCP maintained by [MMJ93](https://github.com/MMJ93), based on
 [`denull0/xbloom-agent`](https://github.com/denull0/xbloom-agent).
 
-Version 2.1.0 adds complete account-shared recipe discovery and portable
-Supabase deployment support.
+Version 2.1.1 adds explicit Omni/Other dripper selection, complete
+account-shared recipe discovery, and portable Supabase deployment support.
 
 Let Codex create custom coffee and tea recipes for your XBloom Studio machine. Just tell Codex about your coffee or tea — or share a photo of the bag — and it designs a recipe that syncs straight to your xBloom app.
 
@@ -100,6 +100,9 @@ Everything below is for developers who want to self-host or modify the server.
 | `xbloom_edit_recipe` | Update an existing recipe by ID |
 | `xbloom_delete_recipe` | Permanently remove a recipe |
 | `xbloom_fetch_recipe` | Import a recipe from a share URL |
+
+Coffee create/edit operations accept `dripper_type: "omni" | "other"`.
+Use `"other"` when a dose above 18g must remain editable in the xBloom app.
 
 ### Self-Hosting
 

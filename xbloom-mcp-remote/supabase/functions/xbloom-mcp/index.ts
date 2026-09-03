@@ -326,6 +326,11 @@ const TOOLS = [
         ratio: { type: "number", description: "Water ratio (total = dose_g * ratio)" },
         grind_size: { type: "number", description: "Grind size 40-120 (lower = finer)" },
         grind_rpm: { type: "number", description: "Grinder RPM 60-120" },
+        dripper_type: {
+          type: "string",
+          enum: ["omni", "other"],
+          description: "App dripper type. Use 'other' for doses above the Omni editor's 18g limit. Default: omni",
+        },
         pours: {
           type: "array",
           description: "Pour steps",
@@ -386,6 +391,11 @@ const TOOLS = [
         ratio: { type: "number" },
         grind_size: { type: "number" },
         grind_rpm: { type: "number" },
+        dripper_type: {
+          type: "string",
+          enum: ["omni", "other"],
+          description: "App dripper type. Use 'other' to keep doses above 18g editable in the xBloom app.",
+        },
         pours: {
           type: "array",
           items: {
@@ -434,6 +444,17 @@ const TOOLS = [
 
 const PATTERN_MAP: Record<string, number> = { centered: 1, spiral: 2, circular: 3 };
 const PATTERN_REV: Record<number, string> = { 1: "centered", 2: "spiral", 3: "circular" };
+const DRIPPER_TYPE_MAP: Record<string, number> = { omni: 2, other: 3 };
+const DRIPPER_TYPE_REV: Record<number, string> = { 1: "xpod", 2: "omni", 3: "other", 4: "tea" };
+
+function cupTypeFor(value: unknown, fallback = 2): number {
+  if (typeof value !== "string") return fallback;
+  return DRIPPER_TYPE_MAP[value.toLowerCase()] ?? fallback;
+}
+
+function dripperTypeFor(value: unknown): string {
+  return DRIPPER_TYPE_REV[Number(value)] ?? "unknown";
+}
 
 interface Pour {
   volume_ml?: number;
@@ -500,7 +521,7 @@ async function listRecipes(creds: UserCredentials): Promise<string> {
     if (!recipes.length) return "No recipes found.";
     const lines = [`Found ${recipes.length} recipes:\n`];
     for (const r of recipes) {
-      lines.push(`  [${r.tableId}] ${r.theName} — ${r.dose}g, 1:${r.grandWater}, grind ${r.grinderSize}, rpm ${r.rpm}`);
+      lines.push(`  [${r.tableId}] ${r.theName} — ${r.dose}g, 1:${r.grandWater}, grind ${r.grinderSize}, rpm ${r.rpm}, type ${dripperTypeFor(r.cupType)}`);
       if (r.shareRecipeLink) lines.push(`    Share: ${r.shareRecipeLink}`);
     }
     return lines.join("\n");
@@ -516,7 +537,7 @@ async function listSharedRecipes(creds: UserCredentials): Promise<string> {
     if (!recipes.length) return "No shared recipes found.";
     const lines = [`Found ${recipes.length} shared recipes:\n`];
     for (const r of recipes) {
-      lines.push(`  [${r.tableId}] ${r.theName} — ${r.dose}g, 1:${r.grandWater}, grind ${r.grinderSize}, rpm ${r.rpm}`);
+      lines.push(`  [${r.tableId}] ${r.theName} — ${r.dose}g, 1:${r.grandWater}, grind ${r.grinderSize}, rpm ${r.rpm}, type ${dripperTypeFor(r.cupType)}`);
       if (r.shareRecipeLink) lines.push(`    Share: ${r.shareRecipeLink}`);
     }
     return lines.join("\n");
@@ -533,7 +554,7 @@ async function createRecipe(args: Record<string, unknown>, creds: UserCredential
     grandWater: Number(args.ratio),
     grinderSize: Number(args.grind_size),
     rpm: Number(args.grind_rpm),
-    cupType: 2,
+    cupType: cupTypeFor(args.dripper_type),
     adaptedModel: 1,
     isEnableBypassWater: 2,
     isSetGrinderSize: 1,
@@ -617,7 +638,9 @@ async function editRecipe(args: Record<string, unknown>, creds: UserCredentials)
     grinderSize: args.grind_size && Number(args.grind_size) > 0 ? Number(args.grind_size) : Number(current.grinderSize),
     rpm: args.grind_rpm && Number(args.grind_rpm) > 0 ? Number(args.grind_rpm) : Number(current.rpm),
     theColor: (args.color as string) || current.theColor || "#C9D5B8",
-    cupType: current.cupType ?? 2,
+    cupType: args.dripper_type
+      ? cupTypeFor(args.dripper_type, Number(current.cupType ?? 2))
+      : Number(current.cupType ?? 2),
     adaptedModel: 1,
     isEnableBypassWater: 2,
     isSetGrinderSize: current.isSetGrinderSize ?? 1,
@@ -674,7 +697,7 @@ async function fetchRecipe(args: Record<string, unknown>): Promise<string> {
       ratio: rv.grandWater ?? 15,
       grind_size: rv.grinderSize ?? 70,
       grind_rpm: rv.rpm ?? 80,
-      cup_type: "omni",
+      cup_type: dripperTypeFor(rv.cupType ?? 2),
       pours: pourList.map(p => ({
         volume_ml: p.volume ?? 30,
         temperature_c: p.temperature ?? 93,
@@ -1132,7 +1155,7 @@ async function handleMcpMessage(body: Record<string, unknown>, accessToken: stri
       return { jsonrpc: "2.0", id, result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "mmj93-xbloom", version: "2.1.0" },
+        serverInfo: { name: "mmj93-xbloom", version: "2.1.1" },
       }};
     case "notifications/initialized":
       return null; // No response for notifications
@@ -1298,7 +1321,7 @@ Deno.serve(async (req: Request) => {
 
   // Health
   if (req.method === "GET") {
-    return jsonResponse({ name: "mmj93-xbloom-mcp", version: "2.1.0", status: "ok" });
+    return jsonResponse({ name: "mmj93-xbloom-mcp", version: "2.1.1", status: "ok" });
   }
   if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
 
