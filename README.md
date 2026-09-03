@@ -6,7 +6,7 @@ Personal xBloom MCP maintained by [MMJ93](https://github.com/MMJ93), based on
 Version 2.1.0 adds complete account-shared recipe discovery and portable
 Supabase deployment support.
 
-Let Claude create custom coffee and tea recipes for your XBloom Studio machine. Just tell Claude about your coffee or tea — or snap a photo of the bag — and it designs a recipe that syncs straight to your xBloom app.
+Let Codex create custom coffee and tea recipes for your XBloom Studio machine. Just tell Codex about your coffee or tea — or share a photo of the bag — and it designs a recipe that syncs straight to your xBloom app.
 
 Works with Codex and other MCP clients that support Streamable HTTP and OAuth.
 
@@ -14,24 +14,19 @@ Works with Codex and other MCP clients that support Streamable HTTP and OAuth.
 
 ## Get Started
 
-### Step 1: Connect to Claude
+### Step 1: Connect to Codex
 
-Open Claude and add this server URL in your integrations settings:
+This deployment is live at:
 
 ```
-https://ramaokxdyszcqpqxmosv.supabase.co/functions/v1/xbloom-mcp
+https://mbwgxlzkscuxtayrlcjh.supabase.co/functions/v1/xbloom-mcp
 ```
 
-**Where to find it:**
-- **Desktop app** — Settings > Integrations > Add
-- **iPhone / Android** — Settings > Integrations > Add
-- **claude.ai** — Profile > Settings > Integrations > Add
-
-Approve the connection when prompted.
+Add it with `codex mcp add` using the command in the developer guide below, then approve the OAuth connection when prompted.
 
 ### Step 2: Sign in with your XBloom account
 
-The first time you use it, Claude will ask for your XBloom email and password. This links your XBloom account so recipes go directly to **your** app. Your password is used once and **never saved**.
+The first time you use it, Codex will ask for your XBloom email and password. This links your XBloom account so recipes go directly to **your** app. Your password is used once and **never saved**.
 
 ### Step 3: Start chatting
 
@@ -57,6 +52,8 @@ Ask Claude to make you a recipe. Here are some ideas:
 
 > *"Show me all my recipes."*
 
+> *"Show me every recipe shared with me."*
+
 > *"Delete the old test recipe."*
 
 Recipes sync instantly to the **xBloom iOS app** and are ready to brew.
@@ -65,7 +62,8 @@ Recipes sync instantly to the **xBloom iOS app** and are ready to brew.
 
 - **Coffee recipes** — Pour-over recipes for the Omni dripper using brewing science (Kasuya 4:6, Hoffmann, Rao, etc.)
 - **Tea recipes** — Steep recipes for the Omni Tea Brewer with proper temperatures and steep times
-- **Photo-to-recipe** — Take a photo of your coffee or tea bag, Claude reads the label and creates a recipe
+- **Shared recipes** — List every recipe shared to your account, with share links
+- **Photo-to-recipe** — Share a photo of your coffee or tea bag, Codex reads the label and creates a recipe
 - **Link-to-recipe** — Paste a product link, Claude pulls the details and designs a recipe
 - **Taste adjustments** — Tell Claude it was too bitter/sour/weak and it tweaks the recipe
 - **Manage recipes** — List, edit, and delete recipes right from the chat
@@ -113,8 +111,8 @@ Everything below is for developers who want to self-host or modify the server.
 #### 1. Clone
 
 ```bash
-git clone https://github.com/denull0/xbloom-agent.git
-cd xbloom-agent/xbloom-mcp-remote
+git clone https://github.com/MMJ93/xbloom-mcp.git
+cd xbloom-mcp/xbloom-mcp-remote
 ```
 
 #### 2. Apply the database migration FIRST
@@ -143,15 +141,15 @@ No environment variables needed — the server uses `SUPABASE_URL` and `SUPABASE
 Add your server URL to Codex or another MCP client:
 
 ```
-https://<your-project>.supabase.co/functions/v1/xbloom-mcp
+https://mbwgxlzkscuxtayrlcjh.supabase.co/functions/v1/xbloom-mcp
 ```
 
 For Codex:
 
 ```bash
-codex mcp add xbloom-mmj93 --url https://<your-project>.supabase.co/functions/v1/xbloom-mcp \
-  --oauth-resource https://<your-project>.supabase.co/functions/v1/xbloom-mcp
-codex mcp login xbloom-mmj93
+codex mcp add xbloom --url https://mbwgxlzkscuxtayrlcjh.supabase.co/functions/v1/xbloom-mcp \
+  --oauth-resource https://mbwgxlzkscuxtayrlcjh.supabase.co/functions/v1/xbloom-mcp
+codex mcp login xbloom
 ```
 
 ### Recipe Parameters
