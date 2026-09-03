@@ -310,6 +310,12 @@ const TOOLS = [
     inputSchema: { type: "object" as const, properties: {}, required: [] as string[] },
   },
   {
+    name: "xbloom_list_shared_recipes",
+    description:
+      "List recipes shared to your XBloom account. These are read-only and separate from recipes you created.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] as string[] },
+  },
+  {
     name: "xbloom_create_recipe",
     description: "Push a new coffee recipe to your XBloom account. Appears in the xBloom iOS app. For tea, use xbloom_create_tea_recipe instead.",
     inputSchema: {
@@ -500,6 +506,22 @@ async function listRecipes(creds: UserCredentials): Promise<string> {
     return lines.join("\n");
   }
   return xbloomFailure(resp, "list recipes");
+}
+
+async function listSharedRecipes(creds: UserCredentials): Promise<string> {
+  const payload = { ...authBase(creds), pageNumber: 1, countPerPage: 100, adaptedModel: 1 };
+  const resp = await postEncrypted("tuMyRecipeShared.tuhtml", payload);
+  if (resp.result === "success") {
+    const recipes = (resp.list as Record<string, unknown>[]) || [];
+    if (!recipes.length) return "No shared recipes found.";
+    const lines = [`Found ${recipes.length} shared recipes:\n`];
+    for (const r of recipes) {
+      lines.push(`  [${r.tableId}] ${r.theName} — ${r.dose}g, 1:${r.grandWater}, grind ${r.grinderSize}, rpm ${r.rpm}`);
+      if (r.shareRecipeLink) lines.push(`    Share: ${r.shareRecipeLink}`);
+    }
+    return lines.join("\n");
+  }
+  return xbloomFailure(resp, "list shared recipes");
 }
 
 async function createRecipe(args: Record<string, unknown>, creds: UserCredentials): Promise<string> {
@@ -719,6 +741,7 @@ async function handleToolCall(params: Record<string, unknown>, accessToken: stri
     let result: string;
     switch (name) {
       case "xbloom_list_recipes": result = await listRecipes(creds); break;
+      case "xbloom_list_shared_recipes": result = await listSharedRecipes(creds); break;
       case "xbloom_create_recipe": result = await createRecipe(args, creds); break;
       case "xbloom_create_tea_recipe": result = await createTeaRecipe(args, creds); break;
       case "xbloom_edit_recipe": result = await editRecipe(args, creds); break;
@@ -1001,7 +1024,9 @@ async function handleToken(req: Request): Promise<Response> {
 
 // --- Main handler ---
 
-const BASE_URL = "https://ramaokxdyszcqpqxmosv.supabase.co/functions/v1/xbloom-mcp";
+// Derive the public MCP URL from the current Supabase project so forks deploy
+// without retaining the upstream project's OAuth issuer/resource URL.
+const BASE_URL = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/xbloom-mcp`;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -1107,7 +1132,7 @@ async function handleMcpMessage(body: Record<string, unknown>, accessToken: stri
       return { jsonrpc: "2.0", id, result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "xbloom", version: "2.0.0" },
+        serverInfo: { name: "mmj93-xbloom", version: "2.1.0" },
       }};
     case "notifications/initialized":
       return null; // No response for notifications
@@ -1272,7 +1297,9 @@ Deno.serve(async (req: Request) => {
   // --- Streamable HTTP transport (POST to root) ---
 
   // Health
-  if (req.method === "GET") return jsonResponse({ name: "xbloom-mcp", status: "ok" });
+  if (req.method === "GET") {
+    return jsonResponse({ name: "mmj93-xbloom-mcp", version: "2.1.0", status: "ok" });
+  }
   if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
 
   // MCP JSON-RPC over POST

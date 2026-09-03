@@ -1,8 +1,14 @@
-# XBloom + Claude
+# MMJ93 xBloom MCP
+
+Personal xBloom MCP maintained by [MMJ93](https://github.com/MMJ93), based on
+[`denull0/xbloom-agent`](https://github.com/denull0/xbloom-agent).
+
+Version 2.1.0 adds complete account-shared recipe discovery and portable
+Supabase deployment support.
 
 Let Claude create custom coffee and tea recipes for your XBloom Studio machine. Just tell Claude about your coffee or tea — or snap a photo of the bag — and it designs a recipe that syncs straight to your xBloom app.
 
-No coding needed. Works on Claude desktop, mobile, and web.
+Works with Codex and other MCP clients that support Streamable HTTP and OAuth.
 
 ---
 
@@ -90,6 +96,7 @@ Everything below is for developers who want to self-host or modify the server.
 |------|-------------|
 | `xbloom_login` | Authenticate with your XBloom account |
 | `xbloom_list_recipes` | List all your recipes with IDs |
+| `xbloom_list_shared_recipes` | List all recipes shared to your account, including share links |
 | `xbloom_create_recipe` | Create a coffee recipe (Omni dripper) |
 | `xbloom_create_tea_recipe` | Create a tea recipe (Omni Tea Brewer) |
 | `xbloom_edit_recipe` | Update an existing recipe by ID |
@@ -131,12 +138,20 @@ supabase functions deploy xbloom-mcp --no-verify-jwt
 
 No environment variables needed — the server uses `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` which are automatically available in edge functions.
 
-#### 4. Connect Claude
+#### 4. Connect your MCP client
 
-Add your server URL in Claude integrations:
+Add your server URL to Codex or another MCP client:
 
 ```
 https://<your-project>.supabase.co/functions/v1/xbloom-mcp
+```
+
+For Codex:
+
+```bash
+codex mcp add xbloom-mmj93 --url https://<your-project>.supabase.co/functions/v1/xbloom-mcp \
+  --oauth-resource https://<your-project>.supabase.co/functions/v1/xbloom-mcp
+codex mcp login xbloom-mmj93
 ```
 
 ### Recipe Parameters
